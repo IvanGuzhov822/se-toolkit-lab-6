@@ -2,11 +2,7 @@
 
 ## Overview
 
-This project implements a command-line interface (CLI) agent (`agent.py`) that accepts questions from the user, sends them to a Large Language Model (LLM), and returns a structured response in JSON format.
-
-At the current stage (Task 1), the agent performs basic plumbing: parse input, call the LLM, and format output. Tools and the agentic loop will be added in subsequent tasks (Tasks 2–3).
-
----
+This project implements a command-line interface (CLI) agent (`agent.py`) that accepts questions from the user, sends them to a Large Language Model (LLM), and returns a structured response in JSON format. The agent has tools to interact with the project repository and implements an agentic loop for multi-step reasoning.
 
 ## Quick Start
 
@@ -33,10 +29,8 @@ uv run agent.py "Your question here"
 ### 3. Example Output
 
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{"answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.", "source": "wiki/git-workflow.md#resolving-merge-conflicts", "tool_calls": [{"tool": "list_files", "args": {"path": "wiki"}, "result": "git-workflow.md"}, {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}, "result": "..."}]}
 ```
-
----
 
 ## LLM Provider
 
@@ -50,8 +44,6 @@ uv run agent.py "Your question here"
 - `LLM_API_BASE` — OpenAI-compatible endpoint URL (example: `http://10.93.25.160:42005/v1`)
 - `LLM_MODEL` — model name (`qwen3-coder-plus`)
 
----
-
 ## Architecture
 
 ### Component Flow
@@ -64,8 +56,8 @@ User CLI → agent.py → VM Proxy (port 42005) → Qwen Cloud LLM
 
 1. **Input Parsing** — the agent reads the question from the first command-line argument
 2. **Configuration Loading** — LLM credentials are loaded from `.env.agent.secret`
-3. **LLM Call** — a POST request is sent to the OpenAI-compatible `/chat/completions` endpoint
-4. **Response Formatting** — the LLM response is wrapped in a JSON object with `answer` and `tool_calls` fields
+3. **Agentic Loop** — the agent sends the question with tool definitions to the LLM, executes tool calls, and repeats until the LLM returns a final answer
+4. **Response Formatting** — the final answer is wrapped in a JSON object with `answer`, `source`, and `tool_calls` fields
 5. **Output** — a single JSON line is printed to stdout
 
 ### Output Routing
@@ -75,7 +67,51 @@ User CLI → agent.py → VM Proxy (port 42005) → Qwen Cloud LLM
 
 This separation allows the agent to be used in pipelines and scripts that parse JSON output.
 
----
+## Tools
+
+The agent has two tools for navigating the project repository.
+
+### read_file
+
+Reads the contents of a file from the project repository.
+
+**Parameters:**
+- `path` (string, required) — relative path to the file from project root
+
+**Returns:** File contents as a string, or an error message if the file does not exist or cannot be read.
+
+**Security:** The tool validates that the requested path does not escape the project root directory. Path traversal attempts using `../` are blocked.
+
+### list_files
+
+Lists files and directories at a given path.
+
+**Parameters:**
+- `path` (string, required) — relative path to the directory from project root
+
+**Returns:** Newline-separated listing of file and directory names, or an error message if the directory does not exist.
+
+**Security:** The tool validates that the requested path does not escape the project root directory. Path traversal attempts using `../` are blocked.
+
+## Agentic Loop
+
+The agentic loop enables multi-step reasoning by iteratively calling tools and feeding results back to the LLM.
+
+### Loop Steps
+
+1. Send the user's question and tool definitions to the LLM
+2. If the LLM responds with tool calls, execute each tool and append results as tool role messages
+3. Send the updated message history back to the LLM
+4. Repeat until the LLM returns a text message (no tool calls) or 10 tool calls are reached
+5. Extract the final answer and source reference from the response
+
+### Maximum Tool Calls
+
+The agent stops after 10 tool calls to prevent infinite loops. If this limit is reached, the agent returns whatever answer it has gathered so far.
+
+### System Prompt Strategy
+
+The system prompt instructs the LLM to use `list_files` to discover wiki files in the `wiki` directory, then use `read_file` to read relevant files and find the answer. The LLM is also instructed to include a source reference in the final answer with file path and section anchor.
 
 ## Project Structure
 
@@ -85,10 +121,9 @@ se-toolkit-lab-6/
 ├── .env.agent.example    # Configuration template
 ├── .env.agent.secret     # Actual configuration (gitignored)
 ├── AGENT.md              # This documentation
+├── wiki/                 # Project documentation wiki
 └── backend/tests/        # Agent tests
 ```
-
----
 
 ## Input and Output Specification
 
@@ -97,23 +132,22 @@ se-toolkit-lab-6/
 One command-line argument containing the question:
 
 ```bash
-uv run agent.py "What does REST stand for?"
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 ### Output
 
-A single JSON line with two required fields:
+A single JSON line with three required fields:
 
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{"answer": "Edit the conflicting file...", "source": "wiki/git-workflow.md#resolving-merge-conflicts", "tool_calls": [...]}
 ```
 
 **Fields:**
 
-- `answer` (string) — the LLM's text response
-- `tool_calls` (array) — empty array in Task 1, populated with tool invocations in Task 2+
-
----
+- `answer` (string) — the final answer extracted from the LLM response
+- `source` (string) — the wiki section reference (e.g., `wiki/git-workflow.md#resolving-merge-conflicts`)
+- `tool_calls` (array) — all tool calls made during the agentic loop, each with `tool`, `args`, and `result` fields
 
 ## Error Handling
 
@@ -124,40 +158,24 @@ The agent exits with code 1 and prints an error message to stderr in the followi
 - HTTP errors (4xx, 5xx) from the LLM provider
 - Request timeout (exceeds 60 seconds)
 - Network errors during the request
+- File access errors (file not found, permission denied)
 
 On successful execution, the agent exits with code 0.
 
----
-
 ## Testing
 
-Run the regression test:
+Run the regression tests:
 
 ```bash
-uv run pytest backend/tests/unit/test_agent.py -v
+uv run pytest test_agent.py -v
 ```
 
-The test verifies:
+The tests verify:
 
 - `agent.py` executes successfully
 - Output is valid JSON
-- Required fields `answer` and `tool_calls` are present
-
----
-
-## Future Extensions
-
-### Task 2: Tools
-
-- Define available tools (search, file operations, API calls)
-- Populate `tool_calls` array with tool invocations from the LLM
-
-### Task 3: Agentic Loop
-
-- Implement the full loop: question → plan → tool calls → execute → answer
-- Support multi-step reasoning and tool execution
-
----
+- Required fields `answer`, `source`, and `tool_calls` are present
+- Tool calls are logged correctly
 
 ## Requirements
 
@@ -165,8 +183,6 @@ The test verifies:
 - Package manager `uv`
 - Access to Qwen Code API (or compatible LLM provider)
 - Configured `.env.agent.secret` file
-
----
 
 ## License
 
