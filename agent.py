@@ -28,7 +28,113 @@ def load_env() -> dict[str, str]:
     return env_vars
 
 
-def call_llm(question: str, api_key: str, api_base: str, model: str, timeout: int = 60) -> str:
+def get_project_root() -> Path:
+    return Path(__file__).parent.parent
+
+
+def validate_path(requested_path: str) -> Path | None:
+    project_root = get_project_root()
+    try:
+        resolved = (project_root / requested_path).resolve()
+        if not str(resolved).startswith(str(project_root.resolve())):
+            return None
+        return resolved.relative_to(project_root.resolve())
+    except (ValueError, RuntimeError):
+        return None
+
+
+def read_file(path: str) -> str:
+    validated = validate_path(path)
+    if validated is None:
+        return f"Error: Access denied - path '{path}' is outside project directory"
+
+    file_path = get_project_root() / validated
+    if not file_path.exists():
+        return f"Error: File not found - {path}"
+    if not file_path.is_file():
+        return f"Error: Not a file - {path}"
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+def list_files(path: str) -> str:
+    validated = validate_path(path)
+    if validated is None:
+        return f"Error: Access denied - path '{path}' is outside project directory"
+
+    dir_path = get_project_root() / validated
+    if not dir_path.exists():
+        return f"Error: Directory not found - {path}"
+    if not dir_path.is_dir():
+        return f"Error: Not a directory - {path}"
+
+    try:
+        entries = sorted(dir_path.iterdir())
+        return "\n".join(entry.name for entry in entries)
+    except Exception as e:
+        return f"Error listing directory: {e}"
+
+
+def get_tool_schemas() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file from the project repository",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the file from project root"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files and directories at a given path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to the directory from project root"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }
+    ]
+
+
+def execute_tool(tool_name: str, args: dict) -> str:
+    if tool_name == "read_file":
+        return read_file(args.get("path", ""))
+    elif tool_name == "list_files":
+        return list_files(args.get("path", ""))
+    else:
+        return f"Error: Unknown tool '{tool_name}'"
+
+
+def call_llm(
+    messages: list[dict],
+    api_key: str,
+    api_base: str,
+    model: str,
+    tools: list[dict] | None = None,
+    timeout: int = 60
+) -> dict:
     url = f"{api_base}/chat/completions"
 
     headers = {
@@ -38,18 +144,12 @@ def call_llm(question: str, api_key: str, api_base: str, model: str, timeout: in
 
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Answer questions concisely and accurately."
-            },
-            {
-                "role": "user",
-                "content": question
-            }
-        ],
+        "messages": messages,
         "temperature": 0.7,
     }
+
+    if tools:
+        payload["tools"] = tools
 
     print(f"Calling LLM at {url} with model {model}...", file=sys.stderr)
 
@@ -58,14 +158,106 @@ def call_llm(question: str, api_key: str, api_base: str, model: str, timeout: in
         response.raise_for_status()
         data = response.json()
 
-    try:
-        answer = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        print(f"Error parsing LLM response: {e}", file=sys.stderr)
-        print(f"Response: {data}", file=sys.stderr)
-        sys.exit(1)
+    return data
 
-    return answer
+
+def extract_source_from_messages(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if content:
+                import re
+                matches = re.findall(r"[\w\-/]+\.[\w]+#[\w\-]+", content)
+                if matches:
+                    return matches[0]
+                file_matches = re.findall(r"[\w\-/]+\.[\w]+", content)
+                if file_matches:
+                    return file_matches[0]
+    return "wiki"
+
+
+def run_agentic_loop(
+    question: str,
+    api_key: str,
+    api_base: str,
+    model: str,
+    max_tool_calls: int = 10
+) -> dict:
+    tools = get_tool_schemas()
+
+    system_prompt = (
+        "You are a documentation agent that helps users find information in the project wiki. "
+        "Use list_files to discover wiki files in the wiki directory. "
+        "Use read_file to read relevant files and find the answer. "
+        "Always include a source reference in your final answer with file path and section anchor (e.g., wiki/git-workflow.md#resolving-merge-conflicts). "
+        "Be concise and accurate."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question}
+    ]
+
+    tool_calls_log = []
+    tool_call_count = 0
+
+    while tool_call_count < max_tool_calls:
+        response_data = call_llm(messages, api_key, api_base, model, tools)
+
+        try:
+            assistant_message = response_data["choices"][0]["message"]
+        except (KeyError, IndexError) as e:
+            print(f"Error parsing LLM response: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        tool_calls = assistant_message.get("tool_calls", [])
+
+        if not tool_calls:
+            final_answer = assistant_message.get("content", "")
+            source = extract_source_from_messages(messages)
+            return {
+                "answer": final_answer,
+                "source": source,
+                "tool_calls": tool_calls_log
+            }
+
+        for tool_call in tool_calls:
+            if tool_call_count >= max_tool_calls:
+                break
+
+            function = tool_call.get("function", {})
+            tool_name = function.get("name", "unknown")
+            tool_args = json.loads(function.get("arguments", "{}"))
+
+            result = execute_tool(tool_name, tool_args)
+
+            tool_calls_log.append({
+                "tool": tool_name,
+                "args": tool_args,
+                "result": result
+            })
+
+            tool_call_count += 1
+
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tool_call]
+            })
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "content": result
+            })
+
+    final_answer = "Maximum tool calls reached. Here is what I found."
+    source = extract_source_from_messages(messages)
+    return {
+        "answer": final_answer,
+        "source": source,
+        "tool_calls": tool_calls_log
+    }
 
 
 def main() -> None:
@@ -96,14 +288,8 @@ def main() -> None:
     api_base = api_base.rstrip("/")
 
     try:
-        answer = call_llm(question, api_key, api_base, model)
-
-        output = {
-            "answer": answer,
-            "tool_calls": []
-        }
-
-        print(json.dumps(output, ensure_ascii=False))
+        result = run_agentic_loop(question, api_key, api_base, model)
+        print(json.dumps(result, ensure_ascii=False))
 
     except httpx.TimeoutException:
         print("Error: LLM request timed out (60 seconds)", file=sys.stderr)
