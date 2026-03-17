@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-'''regression test'''
+'''regression test '''
 def test_agent_outputs_valid_json_with_required_fields() -> None:
     project_root = Path(__file__).parent.parent.parent.parent
     agent_path = project_root / "agent.py"
