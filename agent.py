@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -28,8 +29,27 @@ def load_env() -> dict[str, str]:
     return env_vars
 
 
+def load_lms_env() -> dict[str, str]:
+    env_file = Path(__file__).parent / ".env.docker.secret"
+    env_vars: dict[str, str] = {}
+
+    if not env_file.exists():
+        return env_vars
+
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
+
+
 def get_project_root() -> Path:
-    return Path(__file__).parent.parent
+    return Path(__file__).parent
 
 
 def validate_path(requested_path: str) -> Path | None:
@@ -79,6 +99,49 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None) -> str:
+    api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    lms_api_key = os.environ.get("LMS_API_KEY")
+
+    if not lms_api_key:
+        return "Error: LMS_API_KEY not found in environment"
+
+    url = f"{api_base.rstrip('/')}{path}"
+
+    headers = {
+        "Authorization": f"Bearer {lms_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                json_body = json.loads(body) if body else None
+                response = client.post(url, headers=headers, json=json_body)
+            elif method.upper() == "PUT":
+                json_body = json.loads(body) if body else None
+                response = client.put(url, headers=headers, json=json_body)
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f"Error: Unsupported HTTP method '{method}'"
+
+            return json.dumps({
+                "status_code": response.status_code,
+                "body": response.text
+            })
+    except httpx.TimeoutException:
+        return "Error: API request timed out (30 seconds)"
+    except httpx.RequestError as e:
+        return f"Error: Request failed: {e}"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON in request body"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def get_tool_schemas() -> list[dict]:
     return [
         {
@@ -114,6 +177,31 @@ def get_tool_schemas() -> list[dict]:
                     "required": ["path"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Send an HTTP request to the deployed backend API. Use for data-dependent queries like item counts, status codes, analytics, or diagnosing API errors. Returns JSON with status_code and body.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method: GET, POST, PUT, DELETE"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API endpoint path, e.g., /items/, /analytics/completion-rate"
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body for POST/PUT requests"
+                        }
+                    },
+                    "required": ["method", "path"]
+                }
+            }
         }
     ]
 
@@ -123,6 +211,12 @@ def execute_tool(tool_name: str, args: dict) -> str:
         return read_file(args.get("path", ""))
     elif tool_name == "list_files":
         return list_files(args.get("path", ""))
+    elif tool_name == "query_api":
+        return query_api(
+            method=args.get("method", "GET"),
+            path=args.get("path", ""),
+            body=args.get("body")
+        )
     else:
         return f"Error: Unknown tool '{tool_name}'"
 
@@ -164,7 +258,7 @@ def call_llm(
 def extract_source_from_messages(messages: list[dict]) -> str:
     for msg in reversed(messages):
         if msg.get("role") == "assistant":
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             if content:
                 import re
                 matches = re.findall(r"[\w\-/]+\.[\w]+#[\w\-]+", content)
@@ -186,10 +280,16 @@ def run_agentic_loop(
     tools = get_tool_schemas()
 
     system_prompt = (
-        "You are a documentation agent that helps users find information in the project wiki. "
-        "Use list_files to discover wiki files in the wiki directory. "
-        "Use read_file to read relevant files and find the answer. "
-        "Always include a source reference in your final answer with file path and section anchor (e.g., wiki/git-workflow.md#resolving-merge-conflicts). "
+        "You are an intelligent agent that helps users find information about the project. "
+        "You have three categories of tools: wiki tools (read_file, list_files), API tool (query_api), and direct knowledge. "
+        "For wiki/documentation questions (e.g., 'According to the project wiki...', 'What does the wiki say about SSH?'), "
+        "use list_files to discover wiki files in the wiki directory, then use read_file to read relevant files. "
+        "Always include a source reference in your final answer with file path and section anchor. "
+        "For system facts (e.g., 'What framework does the backend use?', 'What port does the API run on?'), "
+        "use read_file to examine source code files like backend/main.py, docker-compose.yml, or configuration files. "
+        "For data-dependent queries (e.g., 'How many items are in the database?', 'What status code does /items/ return?'), "
+        "use query_api to send HTTP requests to the running backend. "
+        "For bug diagnosis questions, first use query_api to reproduce the error, then use read_file on the relevant source code. "
         "Be concise and accurate."
     )
 
@@ -213,7 +313,7 @@ def run_agentic_loop(
         tool_calls = assistant_message.get("tool_calls", [])
 
         if not tool_calls:
-            final_answer = assistant_message.get("content", "")
+            final_answer = (assistant_message.get("content") or "")
             source = extract_source_from_messages(messages)
             return {
                 "answer": final_answer,
