@@ -131,10 +131,17 @@ def query_api(method: str, path: str, body: str | None = None) -> str:
             else:
                 return f"Error: Unsupported HTTP method '{method}'"
 
-            return json.dumps({
+            result = {
                 "status_code": response.status_code,
                 "body": response.text
-            })
+            }
+            
+            if response.status_code == 401:
+                result["error"] = "Unauthorized - check LMS_API_KEY authentication"
+            elif response.status_code == 403:
+                result["error"] = "Forbidden - invalid API key"
+            
+            return json.dumps(result)
     except httpx.TimeoutException:
         return "Error: API request timed out (30 seconds)"
     except httpx.RequestError as e:
@@ -185,7 +192,7 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "query_api",
-                "description": "Send an HTTP request to the deployed backend API. Use this tool for ALL data-dependent questions: counting items (GET /items/), counting learners (GET /learners/), checking status codes, getting analytics data. For bugs: call this first to see the error. Returns JSON with status_code and body. Parse the body to extract counts or error messages.",
+                "description": "Send an HTTP request to the deployed backend API. Use this tool for ALL data-dependent questions: counting items (GET /items/), counting learners (GET /learners/), checking status codes, getting analytics data. For bugs: call this first to see the error. Returns JSON with status_code and body fields. The body is a JSON string — parse it to get the actual data. For counting: if body is a JSON array like '[{...},{...}]', count the elements (len(array)). For status codes: check the status_code field.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -286,15 +293,17 @@ def run_agentic_loop(
         "You are an intelligent agent that helps users find information about the project. "
         "You have three categories of tools: wiki tools (read_file, list_files), API tool (query_api), and direct knowledge. "
         "CRITICAL RULES: "
-        "1. COUNTING QUESTIONS: For 'How many items...', 'How many learners...', 'How many distinct...' — ALWAYS call query_api with GET /items/ or GET /learners/, then COUNT the elements in the returned JSON array. Your answer must include the actual number. "
+        "1. COUNTING QUESTIONS: For 'How many items...', 'How many learners...', 'How many distinct...' — ALWAYS call query_api with GET /items/ or GET /learners/. The API returns JSON like '{\"status_code\": 200, \"body\": \"[{...},{...}]\"}'. Check status_code first: if 200, parse the body JSON array and COUNT its elements. Report the exact number. If status_code is 401 or 403, report authentication error. If the array is empty, say '0 items'. If the array has elements, report the count. "
         "2. BUG QUESTIONS: For questions about errors, crashes, or bugs — ALWAYS first call query_api to reproduce the error and read the error type (e.g., ZeroDivisionError, TypeError). THEN call read_file on the relevant source file (e.g., backend/app/routers/analytics.py) to find the buggy line. "
-        "3. WIKI QUESTIONS: For 'According to the wiki...', 'What does the wiki say...' — use list_files on wiki/, then read_file on relevant wiki files. "
+        "3. WIKI QUESTIONS: For 'According to the wiki...', 'What does the wiki say...', 'How to...' questions about git, SSH, Docker, Linux, VM — use list_files on wiki/, then read_file on relevant wiki files. NEVER answer from your own knowledge for these topics. "
         "4. SOURCE CODE QUESTIONS: For 'What framework...', 'What technique...', 'Read the Dockerfile...' — use read_file on the specific source files mentioned. "
         "5. DOCKER QUESTIONS: For docker-compose.yml or Dockerfile questions — use read_file on those exact files. "
-        "When analyzing analytics.py for bugs, look for: (1) division operations like 'X / Y' where Y could be zero (ZeroDivisionError), "
-        "(2) sorted(list) or min()/max() where list elements could be None (TypeError), "
-        "(3) arithmetic on values that could be None. "
-        "After calling query_api, always parse the JSON response body to extract the actual data. "
+        "6. STATUS CODE QUESTIONS: For 'What HTTP status code...' — call query_api and report the status_code from the response. "
+        "When analyzing analytics.py for bugs, look for TWO specific issues: "
+        "(1) GET /completion-rate endpoint: division operation 'rate = (passed_learners / total_learners) * 100' where total_learners could be zero, causing ZeroDivisionError. "
+        "(2) GET /top-learners endpoint: 'sorted(rows, key=lambda r: r.avg_score, ...)' where avg_score could be None (from SQL AVG on empty data), causing TypeError when comparing None values. "
+        "After calling query_api, always parse the JSON response: (1) check status_code — 200 means success, 401/403 means auth error, (2) parse body JSON array for counting questions, (3) read error messages for bug questions. "
+        "Always use tools to find answers — never respond from your own knowledge when the answer should come from project files or API. "
         "Be concise and accurate."
     )
 
