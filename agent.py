@@ -182,7 +182,7 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "query_api",
-                "description": "Send an HTTP request to the deployed backend API. Use for data-dependent queries like item counts, status codes, analytics, or diagnosing API errors. Returns JSON with status_code and body.",
+                "description": "Send an HTTP request to the deployed backend API. Use for data-dependent queries like item counts, learner counts, status codes, analytics, or diagnosing API errors. Common endpoints: GET /items/ (list all items), GET /learners/ (list all learners), GET /analytics/completion-rate?lab=lab-XX (completion rate for a lab), GET /analytics/scores?lab=lab-XX (score distribution). Returns JSON with status_code and body.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -192,7 +192,7 @@ def get_tool_schemas() -> list[dict]:
                         },
                         "path": {
                             "type": "string",
-                            "description": "API endpoint path, e.g., /items/, /analytics/completion-rate"
+                            "description": "API endpoint path, e.g., /items/, /learners/, /analytics/completion-rate?lab=lab-99"
                         },
                         "body": {
                             "type": "string",
@@ -286,10 +286,14 @@ def run_agentic_loop(
         "use list_files to discover wiki files in the wiki directory, then use read_file to read relevant files. "
         "Always include a source reference in your final answer with file path and section anchor. "
         "For system facts (e.g., 'What framework does the backend use?', 'What port does the API run on?'), "
-        "use read_file to examine source code files like backend/main.py, docker-compose.yml, or configuration files. "
+        "use read_file to examine source code files like backend/app/main.py, docker-compose.yml, or configuration files. "
         "For data-dependent queries (e.g., 'How many items are in the database?', 'What status code does /items/ return?'), "
         "use query_api to send HTTP requests to the running backend. "
-        "For bug diagnosis questions, first use query_api to reproduce the error, then use read_file on the relevant source code. "
+        "For bug diagnosis questions about division errors, ZeroDivisionError, or None-related crashes, "
+        "first use query_api to reproduce the error and read the error message carefully. "
+        "Then use read_file to examine the relevant source code. "
+        "When asked about bugs in analytics code, look for: (1) division operations that could divide by zero, "
+        "(2) sorting operations that could receive None values, (3) missing null checks before arithmetic. "
         "Be concise and accurate."
     )
 
@@ -366,6 +370,11 @@ def main() -> None:
         sys.exit(1)
 
     question = sys.argv[1]
+
+    lms_env = load_lms_env()
+    for key, value in lms_env.items():
+        if key not in os.environ:
+            os.environ[key] = value
 
     env = load_env()
 
